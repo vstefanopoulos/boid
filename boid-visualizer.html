@@ -1,0 +1,689 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BoidOrnamenter — live flock visualizer</title>
+
+<style>
+  /* Deliberately committed to a single dark look — the flock aesthetic from
+     Ben Eater's boids demo (surface #282c34), not a theme-aware chart. The
+     categorical slots below were re-validated all-pairs against THIS surface. */
+  :root {
+    --plane: #21252b;
+    --surface-1: #282c34;              /* the canvas stage */
+    --panel: #2c313a;
+    --ink-1: #e6e9ef;
+    --ink-2: #a5adba;
+    --ink-muted: #6b7480;
+    --grid: rgba(255, 255, 255, 0.06);
+    --keybed: rgba(255, 255, 255, 0.038);   /* black-key rows behind the flock */
+    --axis: rgba(255, 255, 255, 0.12);
+    --border: rgba(255, 255, 255, 0.09);
+
+    /* 6 slots is the ceiling: a 7th collapses to CVD ΔE 4.7.
+       Green sits at 2.83:1 on this surface — the relief is the direct labels,
+       legend and table view, all of which ship. */
+    --v1: #3987e5;  --v2: #c98500;  --v3: #008300;
+    --v4: #e66767;  --v5: #d55181;  --v6: #d95926;
+    --v-over: #8d95a1;                 /* voice 7+ folds into neutral */
+
+    --good: #0ca30c;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--plane);
+    color: var(--ink-1);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    min-height: 100vh;
+  }
+
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 14px 20px; border-bottom: 1px solid var(--border);
+  }
+  h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
+  header .sub { color: var(--ink-muted); font-size: 13px; margin-right: auto; }
+
+  button, select {
+    font: inherit; color: var(--ink-1); background: var(--panel);
+    border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px;
+  }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--ink-muted); }
+  button[aria-pressed="true"] { background: var(--ink-1); color: var(--surface-1); border-color: var(--ink-1); }
+
+  .status { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--ink-2); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-muted); }
+  .dot.live { background: var(--good); }
+
+  main {
+    display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 16px;
+    padding: 16px 20px; align-items: start;
+  }
+  @media (max-width: 860px) { main { grid-template-columns: minmax(0, 1fr); } }
+
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 14px;
+  }
+  .panel h2 {
+    font-size: 11px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.06em; color: var(--ink-muted); margin: 0 0 10px;
+  }
+  #stage { padding: 0; overflow: hidden; background: var(--surface-1); }
+  canvas { display: block; width: 100%; height: 620px; }
+
+  /* Legend — identity is never color-alone: swatch + name together. */
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; padding: 10px 14px; border-top: 1px solid var(--border); }
+  .legend .item { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--ink-2); }
+  .sw { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+  .legend .pitch { color: var(--ink-1); font-variant-numeric: tabular-nums; }
+  .legend .held {
+    color: var(--ink-muted); font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.05em; border: 1px solid var(--border);
+    border-radius: 4px; padding: 0 4px;
+  }
+  .legend .empty { color: var(--ink-muted); font-size: 13px; }
+
+  .kv { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; font-size: 13px; }
+  .kv dt { color: var(--ink-2); }
+  .kv dd { margin: 0; text-align: right; color: var(--ink-1); font-variant-numeric: tabular-nums; }
+  .kv .meter { grid-column: 1 / -1; height: 2px; background: var(--grid); border-radius: 1px; margin-bottom: 4px; }
+  .kv .meter i { display: block; height: 100%; background: var(--ink-muted); border-radius: 1px; }
+  .sep { grid-column: 1 / -1; height: 1px; background: var(--border); margin: 8px 0 6px; }
+
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: right; padding: 5px 8px; border-bottom: 1px solid var(--border); font-variant-numeric: tabular-nums; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--ink-muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .voice-cell { display: inline-flex; align-items: center; gap: 6px; }
+  #tableWrap { display: none; overflow-x: auto; margin-top: 16px; }
+  #tableWrap.on { display: block; }
+
+  .hint { padding: 14px 20px; color: var(--ink-2); font-size: 13px; max-width: 70ch; }
+  .hint code { background: var(--surface-1); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+</style>
+
+<header>
+  <h1>BoidOrnamenter</h1>
+  <span class="sub">live flock telemetry</span>
+  <select id="inputs" aria-label="MIDI input"><option>No MIDI access</option></select>
+  <button id="connect">Enable MIDI</button>
+  <button id="demo" aria-pressed="false">Demo</button>
+  <button id="tableBtn" aria-pressed="false">Table</button>
+  <span class="status"><span class="dot" id="dot"></span><span id="statusText">idle</span></span>
+</header>
+
+<main>
+  <div>
+    <section class="panel" id="stage">
+      <canvas id="c"></canvas>
+      <div class="legend" id="legend"><span class="empty">No voices — hold a chord in Logic.</span></div>
+    </section>
+
+    <section class="panel" id="tableWrap">
+      <h2>Voice state</h2>
+      <table>
+        <thead>
+          <tr><th>Voice</th><th>Home</th><th>Pitch</th><th>MIDI</th><th>Energy</th><th>Dir</th><th>Last vel</th></tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </section>
+  </div>
+
+  <aside class="panel">
+    <h2>Engine</h2>
+    <dl class="kv" id="hud"></dl>
+  </aside>
+</main>
+
+<p class="hint">
+  Set <strong>Telemetry</strong> to <strong>On</strong> in the Scripter UI, route the track through
+  <strong>External Instrument → IAC Bus 1</strong>, then pick that bus above. <strong>Demo</strong> feeds
+  the page synthetic frames so you can check it renders before wiring Logic up.
+</p>
+
+<script>
+"use strict";
+
+/* ===========================================================================
+   PROTOCOL v1 — mirrors the Telemetry module in BoidOrnamenter.js.
+   Voice stream on channels 1..15, global stream on channel 16.
+=========================================================================== */
+const CC = { PITCH: 102, SRC: 103, ENERGY: 104, DIR: 105, FIRE: 106,
+             VOICES: 110, PARAM_IDX: 111, PARAM_VAL: 112, EVENT: 113, TEMPO: 114 };
+const GLOBAL_CH = 16;
+
+const SCALES = ["Major (Ionian)", "Natural Minor", "Harmonic Minor", "Melodic Minor",
+                "Dorian", "Phrygian", "Lydian", "Mixolydian", "Pentatonic Maj",
+                "Pentatonic Min", "Blues", "Whole Tone", "Chromatic"];
+const KEYS = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+const RATES = ["1/4", "1/4T", "1/8", "1/8T", "1/16", "1/16T", "1/32"];
+const RATE_BEATS = { "1/4": 1, "1/4T": 2 / 3, "1/8": 0.5, "1/8T": 1 / 3,
+                     "1/16": 0.25, "1/16T": 1 / 6, "1/32": 0.125 };
+
+// Index is the wire format — order must match TELEMETRY_PARAMS in the script.
+const PARAMS = [
+  { key: "intensity",   label: "Movement",      min: 0,   max: 1,   fmt: pct,  meter: true },
+  { key: "separation",  label: "Separation",    min: 0,   max: 1,   fmt: pct,  meter: true },
+  { key: "cohesion",    label: "Cohesion",      min: 0,   max: 1,   fmt: pct,  meter: true },
+  { key: "alignment",   label: "Alignment",     min: 0,   max: 1,   fmt: pct,  meter: true },
+  { key: "scale",       label: "Scale",         min: 0,   max: 12,  fmt: v => SCALES[Math.round(v)] },
+  { key: "root",        label: "Key",           min: 0,   max: 11,  fmt: v => KEYS[Math.round(v)] },
+  { key: "chordPref",   label: "Chord tones",   min: 0,   max: 1,   fmt: pct,  meter: true },
+  { key: "tensionProb", label: "Tension",       min: 0,   max: 1,   fmt: pct,  meter: true },
+  { key: "maxInterval", label: "Max interval",  min: 1,   max: 12,  fmt: v => Math.round(v) + " st" },
+  { key: "octaves",     label: "Register",      min: 0,   max: 3,   fmt: v => "±" + Math.round(v) + " oct" },
+  { key: "crossing",    label: "Voice crossing",min: 0,   max: 1,   fmt: v => (v > 0.5 ? "On" : "Off") },
+  { key: "rate",        label: "Update rate",   min: 0,   max: 6,   fmt: v => RATES[Math.round(v)] },
+  { key: "density",     label: "Density",       min: 0,   max: 1,   fmt: pct,  meter: true },
+  { key: "noteLength",  label: "Note length",   min: 0.1, max: 1.5, fmt: v => v.toFixed(2) + "×" },
+  { key: "velScale",    label: "Velocity",      min: 0.2, max: 1.2, fmt: v => v.toFixed(2) + "×" },
+  { key: "humanize",    label: "Humanize",      min: 0,   max: 1,   fmt: pct,  meter: true },
+];
+function pct(v) { return Math.round(v * 100) + "%"; }
+
+/* =========================================================================== */
+
+const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+const noteName = p => NOTE_NAMES[((p % 12) + 12) % 12] + (Math.floor(p / 12) - 1);
+
+const WINDOW_MS = 8000;          // how much history the plot shows
+const VOICE_SLOTS = 6;           // colored slots; beyond this, voices go neutral
+
+// The pitch axis is FIXED to the full 88-key piano (A0..C8) and never rescales.
+// An axis that breathed with the flock's range made every voice look like it was
+// moving even when it was holding still, and made two takes impossible to compare.
+const PIANO_LO = 21;             // A0
+const PIANO_HI = 108;            // C8
+const BLACK_KEYS = { 1: 1, 3: 1, 6: 1, 8: 1, 10: 1 };
+
+const state = {
+  voices: new Map(),             // channel -> voice
+  count: 0,
+  tempo: 120,
+  cfg: {},
+  pendingParam: null,
+  lastMsg: 0,
+};
+
+function voiceColor(ch) {
+  const css = ch <= VOICE_SLOTS ? `--v${ch}` : "--v-over";
+  return getComputedStyle(document.documentElement).getPropertyValue(css).trim();
+}
+function ink(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+function getVoice(ch) {
+  let v = state.voices.get(ch);
+  if (!v) {
+    v = { ch, src: 60, cur: 60, energy: 0.5, dir: 0, fired: 0, trail: [],
+          lastSeen: performance.now() };
+    state.voices.set(ch, v);
+  }
+  return v;
+}
+
+// Derived, never stored: a voice is held iff its own telemetry has gone quiet.
+// Deriving it means it cannot drift out of sync with reality if a frame is
+// dropped or the render loop is throttled.
+function isHeld(v, now) {
+  return (now ?? performance.now()) - v.lastSeen > graceMs();
+}
+
+// How long a voice may go quiet before we call it stopped.
+//
+// A voice only emits telemetry when it STEPS, so the gap between its frames is
+// one Update Rate step — at 1/4 and a slow tempo that is over a second. And the
+// voice count dips constantly during normal playback: BoidOrnamenter fires
+// flockSize() on every note-off, so a MIDI file re-articulating a chord reports
+// 2 voices (or 0) in the gap between note-off and note-on. Retiring a voice on
+// that dip is what made a steady 3-note file render as 2.
+//
+// So liveness is per-voice and time-based, and the window scales with the step
+// interval rather than being a guessed constant.
+function graceMs() {
+  const rate = RATES[Math.round(state.cfg.rate ?? 4)] ?? "1/16";
+  const stepMs = (RATE_BEATS[rate] ?? 0.25) * 60000 / (state.tempo || 120);
+  return Math.max(1500, stepMs * 4);
+}
+
+// Transport stopped / engine reset: force every voice to hold on the next frame.
+function holdAll() {
+  for (const v of state.voices.values()) v.lastSeen = 0;
+}
+
+/* --- wire decode ---------------------------------------------------------- */
+function onMidi(data) {
+  const status = data[0];
+  if ((status & 0xf0) !== 0xb0) return;            // control change only
+  const ch = (status & 0x0f) + 1;
+  const num = data[1], val = data[2];
+  state.lastMsg = performance.now();
+
+  if (ch === GLOBAL_CH) {
+    switch (num) {
+      case CC.VOICES: {
+        state.count = val;
+        // Retire surplus channels only once they have ALSO gone quiet. A count
+        // dip during a re-articulated chord is transient; a voice that is still
+        // stepping is still alive, whatever the count momentarily says.
+        if (val === 0) break;                        // let the grace window decide
+        const t = performance.now(), g = graceMs();
+        for (const [k, v] of [...state.voices]) {
+          if (k > val && t - v.lastSeen > g) state.voices.delete(k);
+        }
+        break;
+      }
+      case CC.TEMPO: state.tempo = val * 2; break;
+      case CC.EVENT: if (val === 0) holdAll(); break;
+      case CC.PARAM_IDX: state.pendingParam = val; break;
+      case CC.PARAM_VAL: {                          // arrives after PARAM_IDX — the commit
+        const p = PARAMS[state.pendingParam];
+        if (p) state.cfg[p.key] = p.min + (val / 127) * (p.max - p.min);
+        state.pendingParam = null;
+        break;
+      }
+    }
+    return;
+  }
+
+  const v = getVoice(ch);
+  switch (num) {
+    case CC.PITCH:  v.cur = val; break;
+    case CC.SRC:
+      // A different home note on this channel means a different voice — a new
+      // chord, or a rank shift after a note was released. Either way the trail
+      // belongs to somebody else, so start it over.
+      if (v.trail.length && val !== v.src) v.trail = [];
+      v.src = val;
+      break;
+    case CC.ENERGY: v.energy = val / 127; break;
+    case CC.DIR:    v.dir = val > 90 ? 1 : (val < 40 ? -1 : 0); break;
+    case CC.FIRE:                                   // last of the frame — commit it
+      v.lastSeen = performance.now();               // fresh telemetry: the voice is live
+      v.fired = val;
+      v.trail.push({ t: v.lastSeen, pitch: v.cur, fired: val, energy: v.energy });
+      break;
+  }
+}
+
+/* --- rendering ------------------------------------------------------------ */
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+
+function fit() {
+  const dpr = window.devicePixelRatio || 1;
+  const r = canvas.getBoundingClientRect();
+  canvas.width = Math.round(r.width * dpr);
+  canvas.height = Math.round(r.height * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return r;
+}
+
+// The boid itself, straight out of Ben Eater's demo: a dart pointing along its
+// heading. `size` scales it (we drive that from energy), `angle` banks it.
+function drawDart(px, py, angle, size, fill, alpha) {
+  ctx.save();
+  ctx.translate(px, py);
+  ctx.rotate(angle);
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = fill;
+  ctx.beginPath();
+  ctx.moveTo(size, 0);
+  ctx.lineTo(-size, size * 0.62);
+  ctx.lineTo(-size * 0.5, 0);
+  ctx.lineTo(-size, -size * 0.62);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+  ctx.globalAlpha = 1;
+}
+
+function draw() {
+  const r = fit();
+  const W = r.width, H = r.height;
+  // PAD_R has to clear the dart + its glow or the current position gets clipped.
+  const PAD_L = 46, PAD_R = 34, PAD_T = 22, PAD_B = 24;
+  const plotW = W - PAD_L - PAD_R, plotH = H - PAD_T - PAD_B;
+  const now = performance.now();
+
+  // Fixed piano scale — the same pitch is always the same height on screen.
+  // Clamped, because a wide Register Range can push a voice past either end of
+  // the keyboard; it pins to the edge rather than drawing outside the plot.
+  const semi = plotH / (PIANO_HI - PIANO_LO);        // pixels per semitone
+  const y = p => PAD_T + plotH -
+                 (Math.max(PIANO_LO, Math.min(PIANO_HI, p)) - PIANO_LO) * semi;
+  const x = t => PAD_L + plotW - ((now - t) / WINDOW_MS) * plotW;
+
+  ctx.fillStyle = ink("--surface-1");
+  ctx.fillRect(0, 0, W, H);
+
+  // --- the keyboard behind the flock: black-key rows as faint stripes, so a
+  //     pitch stays readable now that the axis spans the whole instrument.
+  ctx.fillStyle = ink("--keybed");
+  for (let p = PIANO_LO; p <= PIANO_HI; p++) {
+    if (!BLACK_KEYS[p % 12]) continue;
+    ctx.fillRect(PAD_L, y(p) - semi / 2, plotW, semi);
+  }
+
+  // --- octave gridlines + C labels, recessive
+  ctx.font = "11px system-ui, -apple-system, sans-serif";
+  ctx.textBaseline = "middle";
+  for (let p = Math.ceil(PIANO_LO / 12) * 12; p <= PIANO_HI; p += 12) {
+    const yy = y(p);
+    ctx.strokeStyle = ink("--axis");
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(PAD_L, yy); ctx.lineTo(W - PAD_R, yy); ctx.stroke();
+    ctx.fillStyle = ink("--ink-muted");
+    ctx.textAlign = "right";
+    ctx.fillText(noteName(p), PAD_L - 8, yy);
+  }
+  ctx.strokeStyle = ink("--axis");
+  ctx.beginPath(); ctx.moveTo(PAD_L, PAD_T); ctx.lineTo(PAD_L, PAD_T + plotH); ctx.stroke();
+
+  ctx.fillStyle = ink("--ink-muted");
+  ctx.textAlign = "left";
+  ctx.fillText("−8s", PAD_L + 2, H - 10);
+  ctx.textAlign = "right";
+  ctx.fillText("now", W - PAD_R, H - 10);
+
+  // A voice counts as stopped only when its OWN telemetry has been quiet longer
+  // than a few of its steps — never merely because the voice count dipped.
+  const voices = [...state.voices.values()].sort((a, b) => a.ch - b.ch);
+  for (const v of voices) v.isHeld = isHeld(v, now);
+
+  // --- per-voice register box + home line: the constraint the boid lives inside
+  const oct = Math.round(state.cfg.octaves ?? 1);
+  for (const v of voices) {
+    const col = voiceColor(v.ch);
+    const yTop = y(Math.min(127, v.src + oct * 12));
+    const yBot = y(Math.max(0, v.src - oct * 12));
+    ctx.globalAlpha = 0.055;
+    ctx.fillStyle = col;
+    ctx.fillRect(PAD_L, yTop, plotW, yBot - yTop);
+    ctx.globalAlpha = 0.3;
+    ctx.strokeStyle = col;
+    ctx.setLineDash([2, 5]);
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(PAD_L, y(v.src)); ctx.lineTo(W - PAD_R, y(v.src)); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+  }
+
+  for (const v of voices) {
+    // A held voice gets no telemetry, so extend its trail with a level sustain —
+    // otherwise its history would simply scroll off and leave a blank stage.
+    // These carry `sustain`, so they never draw a dart: nothing actually stepped.
+    if (v.isHeld && v.trail.length) {
+      const last = v.trail[v.trail.length - 1];
+      if (now - last.t > 120) {
+        v.trail.push({ t: now, pitch: v.cur, fired: 0, energy: v.energy, sustain: true });
+      }
+    }
+
+    while (v.trail.length && now - v.trail[0].t > WINDOW_MS) v.trail.shift();
+    if (!v.trail.length) continue;
+    const col = voiceColor(v.ch);
+
+    // --- trail: smooth flight path, fading out behind the boid.
+    // Drawn per-segment so the tail can dissolve rather than stopping dead.
+    ctx.lineWidth = 2;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.strokeStyle = col;
+    for (let i = 1; i < v.trail.length; i++) {
+      const a = v.trail[i - 1], b = v.trail[i];
+      ctx.globalAlpha = 0.10 + 0.55 * (i / v.trail.length);
+      ctx.beginPath();
+      ctx.moveTo(x(a.t), y(a.pitch));
+      ctx.lineTo(x(b.t), y(b.pitch));
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // --- one dart per step, banked along the path it flew in on.
+    // Filled = an ornament actually sounded (size ∝ velocity).
+    // Hollow outline = a step the Density gate silenced. Those are the whole
+    // reason telemetry exists — no recorded MIDI file contains them.
+    for (let i = 0; i < v.trail.length; i++) {
+      const pt = v.trail[i];
+      if (pt.sustain) continue;                      // a hold, not a step — no dart
+      const px = x(pt.t), py = y(pt.pitch);
+      if (px < PAD_L) continue;
+
+      const prev = v.trail[i - 1];
+      const ang = prev
+        ? Math.atan2(py - y(prev.pitch), Math.max(4, px - x(prev.t)))
+        : 0;
+      const fade = 0.25 + 0.75 * (i / Math.max(1, v.trail.length - 1));
+
+      if (pt.fired > 0) {
+        drawDart(px, py, ang, 3 + (pt.fired / 127) * 3, col, 0.55 * fade + 0.35);
+      } else {
+        ctx.save();
+        ctx.translate(px, py); ctx.rotate(ang);
+        ctx.globalAlpha = 0.35 * fade;
+        ctx.strokeStyle = col;
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.moveTo(4, 0); ctx.lineTo(-4, 2.6); ctx.lineTo(-2, 0); ctx.lineTo(-4, -2.6);
+        ctx.closePath();
+        ctx.stroke();
+        ctx.restore();
+        ctx.globalAlpha = 1;
+      }
+    }
+  }
+
+  // --- the boid itself: the leading dart, glowing with its energy,
+  //     plus a direct label (identity never rests on color alone)
+  const heads = voices.map(v => ({
+    v,
+    px: Math.min(x(now), PAD_L + plotW),
+    py: y(v.cur),
+  }));
+
+  for (const h of heads) {
+    const { v, px, py } = h;
+    const col = voiceColor(v.ch);
+    const prev = v.trail[v.trail.length - 2];
+
+    // A held voice coasts level and dims — still there, plainly not flying.
+    const ang = v.isHeld || !prev
+      ? 0
+      : Math.atan2(py - y(prev.pitch), Math.max(6, px - x(prev.t)));
+
+    ctx.save();
+    ctx.shadowColor = col;
+    ctx.shadowBlur = v.isHeld ? 6 : 8 + v.energy * 22;  // energy = how hot it burns
+    drawDart(px, py, ang, 7 + (v.isHeld ? 0 : v.energy * 4), col, v.isHeld ? 0.45 : 1);
+    ctx.restore();
+  }
+
+  // Voices sitting a semitone apart would otherwise stack their labels on top of
+  // each other. Push them apart vertically, keeping the reading order.
+  const LABEL_GAP = 14;
+  const labels = heads.slice().sort((a, b) => a.py - b.py);
+  labels.forEach((l, i) => { l.ly = i === 0 ? l.py : Math.max(l.py, labels[i - 1].ly + LABEL_GAP); });
+
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
+  ctx.font = "600 11px system-ui, -apple-system, sans-serif";
+  for (const l of labels) {
+    const { v, px, py, ly } = l;
+    if (Math.abs(ly - py) > 2) {                     // leader line back to the boid
+      ctx.strokeStyle = voiceColor(v.ch);
+      ctx.globalAlpha = 0.4;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(px - 14, py);
+      ctx.lineTo(px - 18, ly);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+    const arrow = v.isHeld ? "·" : v.dir > 0 ? "↑" : v.dir < 0 ? "↓" : "·";
+    ctx.fillStyle = ink(v.isHeld ? "--ink-2" : "--ink-1");
+    ctx.fillText(`V${v.ch} ${noteName(v.cur)} ${arrow}`, px - 20, ly);
+  }
+
+  renderLegend(voices);
+  renderTable(voices);
+  requestAnimationFrame(draw);
+}
+
+/* --- chrome --------------------------------------------------------------- */
+const legendEl = document.getElementById("legend");
+const tbody = document.getElementById("tbody");
+const hud = document.getElementById("hud");
+
+function renderLegend(voices) {
+  if (!voices.length) {
+    legendEl.innerHTML = '<span class="empty">No voices — hold a chord in Logic.</span>';
+    return;
+  }
+  legendEl.innerHTML = voices.map(v => `
+    <span class="item">
+      <span class="sw" style="background:${voiceColor(v.ch)}"></span>
+      Voice ${v.ch} <span class="pitch">${noteName(v.cur)}</span>${v.isHeld ? ' <span class="held">held</span>' : ""}
+    </span>`).join("");
+}
+
+function renderTable(voices) {
+  if (!document.getElementById("tableWrap").classList.contains("on")) return;
+  tbody.innerHTML = voices.map(v => `
+    <tr>
+      <td><span class="voice-cell"><span class="sw" style="background:${voiceColor(v.ch)}"></span>V${v.ch}</span></td>
+      <td>${noteName(v.src)}</td>
+      <td>${noteName(v.cur)}</td>
+      <td>${v.cur}</td>
+      <td>${Math.round(v.energy * 100)}%</td>
+      <td>${v.isHeld ? "held" : v.dir > 0 ? "up" : v.dir < 0 ? "down" : "still"}</td>
+      <td>${v.fired || "—"}</td>
+    </tr>`).join("");
+}
+
+function renderHud() {
+  const all = [...state.voices.values()];
+  const live = all.filter(v => !isHeld(v)).length;
+  const rows = [
+    `<dt>Tempo</dt><dd>${Math.round(state.tempo)} BPM</dd>`,
+    `<dt>Voices</dt><dd>${live || (all.length ? `${all.length} held` : 0)}</dd>`,
+    `<div class="sep"></div>`,
+  ];
+  for (const p of PARAMS) {
+    const v = state.cfg[p.key];
+    if (v === undefined) { rows.push(`<dt>${p.label}</dt><dd>—</dd>`); continue; }
+    rows.push(`<dt>${p.label}</dt><dd>${p.fmt(v)}</dd>`);
+    if (p.meter) {
+      const f = (v - p.min) / (p.max - p.min);
+      rows.push(`<div class="meter"><i style="width:${Math.round(f * 100)}%"></i></div>`);
+    }
+  }
+  hud.innerHTML = rows.join("");
+  setTimeout(renderHud, 100);
+}
+
+const dot = document.getElementById("dot");
+const statusText = document.getElementById("statusText");
+function setStatus(text, live) {
+  statusText.textContent = text;
+  dot.classList.toggle("live", !!live);
+}
+
+/* --- Web MIDI ------------------------------------------------------------- */
+const inputsEl = document.getElementById("inputs");
+let access = null, bound = null;
+
+document.getElementById("connect").addEventListener("click", async () => {
+  try {
+    access = await navigator.requestMIDIAccess({ sysex: false });
+  } catch (e) {
+    setStatus("MIDI denied — " + e.message, false);
+    return;
+  }
+  const refresh = () => {
+    const ins = [...access.inputs.values()];
+    inputsEl.innerHTML = ins.length
+      ? ins.map(i => `<option value="${i.id}">${i.name}</option>`).join("")
+      : "<option>No MIDI inputs</option>";
+    if (ins.length) bind(ins[0].id);
+  };
+  access.onstatechange = refresh;
+  refresh();
+});
+
+function bind(id) {
+  if (!access) return;
+  if (bound) bound.onmidimessage = null;
+  bound = access.inputs.get(id);
+  if (!bound) return;
+  bound.onmidimessage = e => onMidi(e.data);
+  setStatus("listening on " + bound.name, true);
+}
+inputsEl.addEventListener("change", e => bind(e.target.value));
+
+/* --- Demo feed: synthetic frames in the same wire format, so the page can be
+       checked without Logic. This is fake data, NOT the real engine. -------- */
+let demoTimer = null;
+const demoBtn = document.getElementById("demo");
+demoBtn.addEventListener("click", () => {
+  if (demoTimer) {
+    clearInterval(demoTimer); demoTimer = null;
+    demoBtn.setAttribute("aria-pressed", "false");
+    state.voices.clear();
+    setStatus("idle", false);
+    return;
+  }
+  demoBtn.setAttribute("aria-pressed", "true");
+  setStatus("demo (synthetic data)", true);
+
+  const src = [55, 60, 64, 67];
+  const cur = src.slice();
+  const cc = (n, val, ch) => onMidi([0xb0 | (ch - 1), n, Math.max(0, Math.min(127, Math.round(val)))]);
+
+  PARAMS.forEach((p, i) => {
+    const demoVals = { scale: 0, root: 0, rate: 4, octaves: 1, crossing: 0, density: 0.6 };
+    const v = demoVals[p.key] ?? (p.min + (p.max - p.min) * 0.55);
+    cc(CC.PARAM_IDX, i, GLOBAL_CH);
+    cc(CC.PARAM_VAL, ((v - p.min) / (p.max - p.min)) * 127, GLOBAL_CH);
+  });
+  cc(CC.TEMPO, 60, GLOBAL_CH);
+  cc(CC.VOICES, src.length, GLOBAL_CH);
+
+  // Loosely imitates the real engine: mostly stepwise, sometimes a third, and
+  // it holds position now and then — a rigid zigzag would misrepresent it.
+  const lean = src.map(() => (Math.random() < 0.5 ? 1 : -1));
+  demoTimer = setInterval(() => {
+    src.forEach((s, i) => {
+      const ch = i + 1;
+      const roll = Math.random();
+      const stride = roll < 0.18 ? 0 : roll < 0.75 ? 2 : roll < 0.94 ? 4 : 7;
+      if (Math.random() < 0.3) lean[i] = -lean[i];
+      let next = cur[i] + stride * lean[i];
+      if (Math.abs(next - s) > 12) { lean[i] = -lean[i]; next = cur[i] + stride * lean[i]; }
+      const dir = Math.sign(next - cur[i]);
+      cur[i] = Math.max(24, Math.min(100, next));
+      const fired = Math.random() < 0.6 ? 50 + Math.random() * 60 : 0;
+      cc(CC.PITCH, cur[i], ch);
+      cc(CC.SRC, s, ch);
+      cc(CC.ENERGY, (0.4 + 0.5 * Math.abs(Math.sin(Date.now() / 900 + i))) * 127, ch);
+      cc(CC.DIR, dir > 0 ? 127 : dir < 0 ? 0 : 64, ch);
+      cc(CC.FIRE, fired, ch);
+    });
+  }, 220);
+});
+
+document.getElementById("tableBtn").addEventListener("click", e => {
+  const on = document.getElementById("tableWrap").classList.toggle("on");
+  e.currentTarget.setAttribute("aria-pressed", String(on));
+});
+
+if (!navigator.requestMIDIAccess) setStatus("Web MIDI unsupported — use Chrome", false);
+window.addEventListener("resize", fit);
+fit();
+renderHud();
+requestAnimationFrame(draw);
+</script>
