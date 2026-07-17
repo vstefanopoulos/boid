@@ -83,6 +83,8 @@ var Music = (function () {
         { name: "Pentatonic Min",  steps: [0, 3, 5, 7, 10] },
         { name: "Blues",           steps: [0, 3, 5, 6, 7, 10] },
         { name: "Whole Tone",      steps: [0, 2, 4, 6, 8, 10] },
+        { name: "Diminished (WH)", steps: [0, 2, 3, 5, 6, 8, 9, 11] },
+        { name: "Diminished (HW)", steps: [0, 1, 3, 4, 6, 7, 9, 10] },
         { name: "Chromatic",       steps: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] }
     ];
 
@@ -190,6 +192,9 @@ var PluginParameters = [
     { name: "Note Length", type: "lin", minValue: 0.1, maxValue: 1.5, defaultValue: 0.7, numberOfSteps: 140, unit: "x rate" },
     { name: "Velocity Scale", type: "lin", minValue: 0.2, maxValue: 1.2, defaultValue: 0.85, numberOfSteps: 100 },
     { name: "Humanize", type: "lin", minValue: 0, maxValue: 1, defaultValue: 0.25, numberOfSteps: 100 },
+    // Latching sustain: ticked = pedal down (CC 64 = 127) and it stays down until
+    // unticked. Lets the ornaments pile up into a wash without a real pedal.
+    { name: "Hold (Sustain)", type: "checkbox", defaultValue: 0 },
 
     { name: "— Telemetry —", type: "text" },
     // Off by default: when On this streams a few hundred CC/sec downstream, which
@@ -463,6 +468,57 @@ var MidiOut = (function () {
 })();
 
 /*==============================================================================
+  MODULE: Sustain — the "Hold (Sustain)" tick box as a latching pedal
+
+  Ticking the box sends CC 64 = 127 downstream and leaves it down; unticking
+  sends CC 64 = 0. ParameterChanged() only records the intent — the pedal event
+  itself is emitted from ProcessMIDI(), which is where Scripter events belong.
+
+  While the box is ticked, an incoming CC 64 is swallowed (see HandleMIDI), so
+  a real pedal underneath cannot lift the latch the UI says is down.
+==============================================================================*/
+var Sustain = (function () {
+
+    var CC_SUSTAIN = 64;
+
+    var pedalDown = false;    // what the downstream instrument currently believes
+    var wanted    = false;    // what the tick box currently asks for
+
+    // Reset() and ParameterChanged() can both fire before the UI exists.
+    function boxTicked() {
+        try { return GetParameter("Hold (Sustain)") === 1; } catch (e) { return false; }
+    }
+
+    function send(down) {
+        var e = new ControlChange();
+        e.number = CC_SUSTAIN;
+        e.value = down ? 127 : 0;
+        e.channel = 1;
+        e.send();
+        pedalDown = down;
+    }
+
+    function refresh() { wanted = boxTicked(); }
+
+    // Called every block: emit a pedal event only when the state actually differs.
+    function update() {
+        if (wanted !== pedalDown) send(wanted);
+    }
+
+    function isDown() { return wanted; }
+
+    // Lift the pedal on reset so a stopped transport can't strand notes ringing,
+    // then re-read the box: if it is still ticked, the next block re-latches it.
+    function reset() {
+        if (pedalDown) send(false);
+        pedalDown = false;
+        refresh();
+    }
+
+    return { refresh: refresh, update: update, isDown: isDown, reset: reset };
+})();
+
+/*==============================================================================
   MODULE: Telemetry — broadcast the full flock state as MIDI CC
 
   Scripter is sandboxed: no sockets, no filesystem, no OSC. MIDI is the only
@@ -634,6 +690,9 @@ function HandleMIDI(event) {
         removeBoid(event.pitch, event.channel);
         // Always forward note-offs so a mid-hold toggle can't strand a note.
         event.send();
+    } else if (event instanceof ControlChange && event.number === 64 && Sustain.isDown()) {
+        // Hold is latched down: swallow the incoming pedal so a real one underneath
+        // can't send a CC 64 = 0 that contradicts the tick box.
     } else {
         event.send();                        // pass through pedals, CCs, pitch-bend, etc.
     }
@@ -646,7 +705,9 @@ function ProcessMIDI() {
     var info = GetTimingInfo();
     Clock.advance(info);
 
-    // Ahead of the early return, so a visualiser still sees the flock empty out.
+    // Ahead of the early return: the pedal must be able to go down (or up) with
+    // no chord held, and a visualiser still needs to see the flock empty out.
+    Sustain.update();
     Telemetry.sync(Clock.now(), Clock.getTempo(), boids.length);
 
     if (!boids.length) return;
@@ -696,6 +757,7 @@ function ParameterChanged(index, value) {
     var p = PluginParameters[index];
     if (!p) return;
     if (p.name === "Seed (0 = random)") reseed();
+    if (p.name === "Hold (Sustain)") Sustain.refresh();   // ProcessMIDI sends the pedal
 
     // Push the change straight out, so a visualiser tracks live knob moves
     // rather than waiting up to 4 beats for the periodic re-broadcast.
@@ -708,6 +770,7 @@ function Reset() {
     heldPitches = {};
     Clock.reset();
     reseed();
+    Sustain.reset();
     Telemetry.reset();
     if (typeof MIDI !== "undefined" && MIDI.allNotesOff) MIDI.allNotesOff();
 }
