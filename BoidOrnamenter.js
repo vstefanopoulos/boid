@@ -186,6 +186,13 @@ var PluginParameters = [
     { name: "Voice Crossing", type: "menu", valueStrings: ["Off", "On"], defaultValue: 0 },
     { name: "Pass Through Chord", type: "menu", valueStrings: ["Off", "On"], defaultValue: 0 },
 
+    { name: "— Tempo —", type: "text" },
+    // Sync to Host follows the project transport tempo. Free runs the flock at
+    // a manual BPM that ignores the project tempo (and keeps running while the
+    // transport is stopped), for ornamenting outside a fixed grid.
+    { name: "Tempo Mode", type: "menu", valueStrings: ["Sync to Host", "Free (manual BPM)"], defaultValue: 0 },
+    { name: "Free Tempo (BPM)", type: "lin", minValue: 20, maxValue: 300, defaultValue: 120, numberOfSteps: 280, unit: "BPM" },
+
     { name: "— Rhythm & Output —", type: "text" },
     { name: "Update Rate", type: "menu", valueStrings: RATE_NAMES, defaultValue: 4 /* 1/16 */ },
     { name: "Ornament Density", type: "lin", minValue: 0, maxValue: 1, defaultValue: 0.6, numberOfSteps: 100 },
@@ -236,16 +243,31 @@ var Params = (function () {
 /*==============================================================================
   MODULE: Clock — a free-running beat clock derived from GetTimingInfo().
   Advances every ProcessMIDI block whether or not the transport is playing,
-  so ornaments keep evolving even on a stopped, held chord.
+  so ornaments keep evolving even on a stopped, held chord. The tempo driving
+  it is either the host transport tempo (Sync) or a manual BPM (Free).
 ==============================================================================*/
 var Clock = (function () {
     var beat = 0;       // internal, monotonically increasing beat position
-    var tempo = 120;
+    var tempo = 120;    // the EFFECTIVE tempo driving the flock (host or free)
 
-    function advance(info) {
-        tempo = (info && info.tempo > 0) ? info.tempo : tempo;
-        var len = (info && info.blockLength > 0) ? info.blockLength : 0;
-        beat += len;
+    // Advance the beat clock one process block.
+    //   sync !== false -> follow the host: the block length already arrives in
+    //                     beats, so add it straight on.
+    //   sync === false -> free-run at freeBpm, independent of the project tempo:
+    //                     convert the host block length (beats) to seconds via
+    //                     the host tempo, then re-express those seconds as beats
+    //                     at freeBpm. Works while the transport is stopped too.
+    function advance(info, sync, freeBpm) {
+        var hostTempo = (info && info.tempo > 0) ? info.tempo : tempo;
+        var lenBeats  = (info && info.blockLength > 0) ? info.blockLength : 0;
+        if (sync === false) {
+            tempo = (freeBpm > 0) ? freeBpm : tempo;
+            var seconds = hostTempo > 0 ? (lenBeats * 60 / hostTempo) : 0;
+            beat += seconds * tempo / 60;
+        } else {
+            tempo = hostTempo;
+            beat += lenBeats;
+        }
         return beat;
     }
     function now()        { return beat; }
@@ -272,6 +294,8 @@ class Boid {
         this.nextFireBeat = 0;                        // when this voice next updates
         this.activePitch  = -1;                       // ornament currently sounding, -1 = none
         this.rank         = 0;                         // low->high ordering for crossing rules
+        this.released     = false;                     // note-off seen; awaiting reap or revival
+        this.releasedBeat = 0;                         // beat the release happened, for the grace
     }
 }
 
@@ -483,6 +507,7 @@ var Sustain = (function () {
 
     var pedalDown = false;    // what the downstream instrument currently believes
     var wanted    = false;    // what the tick box currently asks for
+    var playing   = false;    // last known transport state
 
     // Reset() and ParameterChanged() can both fire before the UI exists.
     function boxTicked() {
@@ -500,18 +525,26 @@ var Sustain = (function () {
 
     function refresh() { wanted = boxTicked(); }
 
-    // Called every block: emit a pedal event only when the state actually differs.
-    function update() {
-        if (wanted !== pedalDown) send(wanted);
+    // Called every block: hold the pedal down only while the box is ticked AND
+    // the transport is running. A stopped transport lifts the latch, so the
+    // sustained wash can never strand notes ringing on a stopped project;
+    // resuming playback re-latches it. Emits a pedal event only on a real change.
+    function update(isPlaying) {
+        playing = !!isPlaying;
+        var target = wanted && playing;
+        if (target !== pedalDown) send(target);
     }
 
-    function isDown() { return wanted; }
+    // True only while we are actually asserting the pedal (ticked + playing), so
+    // the CC 64 swallow in HandleMIDI matches what we are really holding down.
+    function isDown() { return wanted && playing; }
 
     // Lift the pedal on reset so a stopped transport can't strand notes ringing,
     // then re-read the box: if it is still ticked, the next block re-latches it.
     function reset() {
         if (pedalDown) send(false);
         pedalDown = false;
+        playing = false;
         refresh();
     }
 
@@ -523,9 +556,14 @@ var Sustain = (function () {
 
   Scripter is sandboxed: no sockets, no filesystem, no OSC. MIDI is the only
   wire out. So instead of a visualiser trying to reverse-engineer the flock
-  from the ornament notes — which cannot work, because the ~(1 - Density) of
-  steps that are silenced never produce a note, and all voices share a channel
-  — the engine simply *states* what every boid is doing, once per step.
+  from the ornament notes — which cannot work, because all voices share one
+  channel and the notes carry no energy / direction / source-note data — the
+  engine simply *states* what each sounding boid is doing, as it fires.
+
+  Telemetry mirrors the audio one-for-one: a voice is broadcast only on the
+  step it actually plays a note. Silent steps (the density gate, Density = 0,
+  or no chord held) send nothing, so the CC stream tracks the ornament notes
+  the instrument receives exactly.
 
   PROTOCOL v1  (must stay in sync with boid-visualizer.html)
 
@@ -534,7 +572,8 @@ var Sustain = (function () {
       CC 103   srcPitch    0..127   the held note this voice orbits
       CC 104   energy      0..127   (energy * 127)
       CC 105   direction   0 = down, 64 = held, 127 = up
-      CC 106   fired       0 = silent step, else the ornament velocity 1..127
+      CC 106   fired       the ornament velocity 1..127 (a packet is only ever
+                           sent for a sounding step, so this is never 0)
                            ^ sent LAST — the visualiser treats it as the commit
                              marker that ends this voice's frame.
 
@@ -604,8 +643,9 @@ var Telemetry = (function () {
         cc(CC_PARAM_VAL, ((GetParameter(p.name) - p.min) / (p.max - p.min)) * 127, GLOBAL_CH);
     }
 
-    // One voice's complete state for this step — including the steps the
-    // Ornament Density gate silences, which is the whole point.
+    // One voice's complete state for a step that actually fired a note. Only
+    // called on sounding steps (see ProcessMIDI), so the telemetry stream
+    // mirrors the ornament notes the instrument receives — no note, no packet.
     function voice(b, firedVel) {
         var ch = b.rank + 1;
         if (ch > MAX_VOICES) return;
@@ -649,8 +689,22 @@ var Telemetry = (function () {
   boids; it is NOT forwarded to the audio engine. The plugin outputs nothing
   but the ornament notes the flock generates.
 ==============================================================================*/
-var boids = [];                 // active voices, one per held note
+var boids = [];                 // ACTIVE voices only — one per currently-held note
 var heldPitches = {};           // pitch -> true, the sustaining original chord
+
+// A re-articulating MIDI region sends note-off then a fresh note-on for the SAME
+// pitch a hair later. Splicing the boid on the note-off and rebuilding it on the
+// note-on restarted its wander at the home note and renumbered the survivors'
+// telemetry channels — which the visualiser reads as a voice reset.
+//
+// So a released voice is moved to a short-lived graveyard rather than destroyed:
+// a note-on that lands inside the grace revives the SAME boid (position, energy
+// and channel intact); only if the grace lapses is it truly discarded. Crucially
+// the graveyard is kept OUT of `boids`, so a lingering voice never inflates the
+// reported voice count nor shifts an active voice onto a higher channel — which
+// is exactly what made the visualiser drift up toward 15 voices.
+var released = [];              // graveyard: released voices awaiting revival / reap
+var REAP_BEATS = 0.25;         // a 16th note — bridges legato retriggers
 
 function rerank() {
     var sorted = boids.slice().sort(function (a, b) { return a.srcPitch - b.srcPitch; });
@@ -658,6 +712,22 @@ function rerank() {
 }
 
 function addBoid(pitch, velocity, channel) {
+    // A note-on that matches a graveyarded voice is a re-articulation: revive
+    // that same boid so its wander and identity carry through, rather than
+    // snapping home and churning the visualiser's trail.
+    for (var i = 0; i < released.length; i++) {
+        var r = released[i];
+        if (r.srcPitch === pitch && r.channel === channel) {
+            released.splice(i, 1);
+            r.released = false;
+            r.srcVelocity = velocity;                 // track the new attack's dynamics
+            r.nextFireBeat = Clock.now() + r.phase * (RATE_BEATS[RATE_NAMES[GetParameter("Update Rate")]] || 0.25);
+            boids.push(r);
+            rerank();
+            Telemetry.flockSize(boids.length);
+            return;
+        }
+    }
     // Ensure the note graph exists before the first ProcessMIDI() runs.
     Music.rebuild(GetParameter("Key"), GetParameter("Scale"));
     var b = new Boid(pitch, velocity, channel);
@@ -668,14 +738,30 @@ function addBoid(pitch, velocity, channel) {
 }
 
 function removeBoid(pitch, channel) {
+    // Silence the ornament and move the voice to the graveyard. It leaves `boids`
+    // immediately (so the count and channels stay honest), but survives there for
+    // the grace so a re-articulation can revive it.
     for (var i = boids.length - 1; i >= 0; i--) {
-        if (boids[i].srcPitch === pitch && boids[i].channel === channel) {
-            MidiOut.silence(boids[i]);
+        var b = boids[i];
+        if (b.srcPitch === pitch && b.channel === channel) {
+            MidiOut.silence(b);
+            b.released = true;
+            b.releasedBeat = Clock.now();
             boids.splice(i, 1);
+            released.push(b);
         }
     }
     rerank();
     Telemetry.flockSize(boids.length);
+}
+
+// Discard graveyard voices whose grace has lapsed with no re-articulation. The
+// active flock is untouched, so no rerank or size broadcast is needed here.
+function reapReleased() {
+    var now = Clock.now();
+    for (var i = released.length - 1; i >= 0; i--) {
+        if (now - released[i].releasedBeat >= REAP_BEATS) released.splice(i, 1);
+    }
 }
 
 function HandleMIDI(event) {
@@ -703,11 +789,27 @@ function HandleMIDI(event) {
 ==============================================================================*/
 function ProcessMIDI() {
     var info = GetTimingInfo();
-    Clock.advance(info);
+
+    // Tempo source: sync to the host transport, or free-run at a manual BPM
+    // independent of the project tempo. Read directly (not via the per-block
+    // snapshot) because the clock must advance before the no-boids early return,
+    // even with the flock empty.
+    var tempoSync = true, freeBpm = 120;
+    try {
+        tempoSync = GetParameter("Tempo Mode") === 0;
+        freeBpm   = GetParameter("Free Tempo (BPM)");
+    } catch (e) {}
+    Clock.advance(info, tempoSync, freeBpm);
+
+    // Retire any voices whose release grace lapsed without a re-articulation,
+    // before anything reads the flock size this block.
+    reapReleased();
 
     // Ahead of the early return: the pedal must be able to go down (or up) with
     // no chord held, and a visualiser still needs to see the flock empty out.
-    Sustain.update();
+    // The latch is asserted only while the transport is running, so stopping the
+    // transport lifts the sustain instead of leaving notes hanging.
+    Sustain.update(!!(info && info.playing));
     Telemetry.sync(Clock.now(), Clock.getTempo(), boids.length);
 
     if (!boids.length) return;
@@ -724,11 +826,13 @@ function ProcessMIDI() {
         while (now >= b.nextFireBeat && guard++ < 4) {
             Flock.step(b, boids, ctx, cfg);  // move through the note graph
 
-            // Sparse, per-voice ornamentation. The voice still MOVED on a silent
-            // step — telemetry reports it either way, which is exactly the part
-            // the recorded MIDI can never show.
+            // Sparse, per-voice ornamentation. Telemetry mirrors the audio: a
+            // voice is broadcast ONLY on a step that actually fires a note, so a
+            // silent step — whether from the density gate or Density = 0 — sends
+            // nothing, and no chord held sends nothing at all. The visualiser
+            // then sees exactly the ornament notes the instrument receives.
             var firedVel = (Rng.next() < cfg.density) ? MidiOut.ornament(b, cfg) : 0;
-            if (cfg.telemetry) Telemetry.voice(b, firedVel);
+            if (cfg.telemetry && firedVel > 0) Telemetry.voice(b, firedVel);
 
             // Per-voice, slightly humanised interval keeps voices from locking up.
             var jitter = 1 + (Rng.next() - 0.5) * cfg.humanize * 0.5;
@@ -767,6 +871,7 @@ function ParameterChanged(index, value) {
 function Reset() {
     for (var i = 0; i < boids.length; i++) MidiOut.silence(boids[i]);
     boids = [];
+    released = [];
     heldPitches = {};
     Clock.reset();
     reseed();

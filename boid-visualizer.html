@@ -74,7 +74,10 @@
   canvas { display: block; width: 100%; height: 620px; }
 
   /* Legend — identity is never color-alone: swatch + name together. */
-  .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; padding: 10px 14px; border-top: 1px solid var(--border); }
+  /* Height is locked: a full 15-voice flock wraps into more rows than the strip
+     can hold, and letting it grow pushed the whole stage taller. Cap it and let
+     the overflow scroll inside the strip instead of resizing the canvas panel. */
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; padding: 10px 14px; border-top: 1px solid var(--border); max-height: 74px; overflow-y: auto; }
   .legend .item { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--ink-2); }
   .sw { width: 10px; height: 10px; border-radius: 3px; flex: none; }
   .legend .pitch { color: var(--ink-1); font-variant-numeric: tabular-nums; }
@@ -110,6 +113,7 @@
   <select id="inputs" aria-label="MIDI input"><option>No MIDI access</option></select>
   <button id="connect">Enable MIDI</button>
   <button id="demo" aria-pressed="false">Demo</button>
+  <button id="reset" title="Clear every voice from the stage">Reset</button>
   <button id="tableBtn" aria-pressed="false">Table</button>
   <span class="status"><span class="dot" id="dot"></span><span id="statusText">idle</span></span>
 </header>
@@ -199,6 +203,15 @@ const VOICE_SLOTS = 6;           // colored slots; beyond this, voices go neutra
 // the flock with the stage instead of stranding it.
 const TRAVERSE_MS = 9000;
 
+// How fast the leading boid glides to a new pitch, as an exponential-ease time
+// constant. This is the ONE knob that trades smoothness for latency: the head
+// reaches ~63% of a jump in SMOOTH_MS, ~95% in 3×. Bigger = silkier but laggier.
+// 100 ms keeps the head almost caught up within a single 1/16 step at 120 BPM,
+// so the glide reads as smoothing rather than drift — a bit of lag, as expected.
+// The tails themselves are smoothed geometrically (a spline through the step
+// points) and add no latency at all; only this head-ease does.
+const SMOOTH_MS = 100;
+
 // The pitch axis is FIXED to the full 88-key piano (A0..C8) and never rescales.
 // An axis that breathed with the flock's range made every voice look like it was
 // moving even when it was holding still, and made two takes impossible to compare.
@@ -230,7 +243,7 @@ function getVoice(ch) {
     // Everyone launches from the left heading right, but staggered across the
     // first quarter of the stage — a flock leaves in a loose front, and voices
     // sharing one x would fly in lockstep like a rack of meters.
-    v = { ch, src: 60, cur: 60, energy: 0.5, dir: 0, fired: 0, trail: [],
+    v = { ch, src: 60, cur: 60, dispPitch: 60, energy: 0.5, dir: 0, fired: 0, trail: [],
           px: Math.random() * 0.25, xdir: 1,
           lastSeen: performance.now() };
     state.voices.set(ch, v);
@@ -411,12 +424,17 @@ function draw() {
 
   // A voice counts as stopped only when its OWN telemetry has been quiet longer
   // than a few of its steps — never merely because the voice count dipped.
+  // Frame-rate-independent ease factor: same glide whether we run at 60 or 30fps.
+  const ease = 1 - Math.exp(-dt / SMOOTH_MS);
   const voices = [...state.voices.values()].sort((a, b) => a.ch - b.ch);
   for (const v of voices) {
     v.isHeld = isHeld(v, now);
     v.px += v.xdir * (dt / TRAVERSE_MS);
     if (v.px >= 1) { v.px = 1; v.xdir = -1; }        // far edge — turn back
     else if (v.px <= 0) { v.px = 0; v.xdir = 1; }    // left edge — turn again
+    // Glide the drawn pitch toward the telemetry target instead of snapping to
+    // it — this is what takes the step out of the leading boid's motion.
+    v.dispPitch += (v.cur - v.dispPitch) * ease;
   }
 
   // --- per-voice register box + home line: the constraint the boid lives inside
@@ -437,73 +455,16 @@ function draw() {
     ctx.globalAlpha = 1;
   }
 
+  // Tails are no longer drawn — only the boid heads. A short history is still
+  // kept (and trimmed to the window) purely so each head can bank along the last
+  // hop it actually flew; none of it is rendered.
   for (const v of voices) {
-    // A held voice gets no telemetry, so extend its trail with a level sustain —
-    // otherwise its history would simply scroll off and leave a blank stage.
-    // These carry `sustain`, so they never draw a dart: nothing actually stepped.
-    if (v.isHeld && v.trail.length) {
-      const last = v.trail[v.trail.length - 1];
-      if (now - last.t > 120) {
-        v.trail.push({ t: now, x: v.px, pitch: v.cur, fired: 0, energy: v.energy, sustain: true });
-      }
-    }
-
     while (v.trail.length && now - v.trail[0].t > WINDOW_MS) v.trail.shift();
-    if (!v.trail.length) continue;
-    const col = voiceColor(v.ch);
-
-    // --- trail: smooth flight path, fading out behind the boid.
-    // Drawn per-segment so the tail can dissolve rather than stopping dead.
-    ctx.lineWidth = 2;
-    ctx.lineCap = "round";
-    ctx.lineJoin = "round";
-    ctx.strokeStyle = col;
-    for (let i = 1; i < v.trail.length; i++) {
-      const a = v.trail[i - 1], b = v.trail[i];
-      ctx.globalAlpha = 0.10 + 0.55 * (i / v.trail.length);
-      ctx.beginPath();
-      ctx.moveTo(x(a.x), y(a.pitch));
-      ctx.lineTo(x(b.x), y(b.pitch));
-      ctx.stroke();
-    }
-    ctx.globalAlpha = 1;
-
-    // --- one dart per step, banked along the path it flew in on.
-    // Filled = an ornament actually sounded (size ∝ velocity).
-    // Hollow outline = a step the Density gate silenced. Those are the whole
-    // reason telemetry exists — no recorded MIDI file contains them.
-    for (let i = 0; i < v.trail.length; i++) {
-      const pt = v.trail[i];
-      if (pt.sustain) continue;                      // a hold, not a step — no dart
-      const px = x(pt.x), py = y(pt.pitch);
-
-      // Bank along the segment actually flown. A dart on the return leg points
-      // left, so the heading is read raw — nothing pins it to "rightwards".
-      const prev = v.trail[i - 1];
-      const ang = prev ? Math.atan2(py - y(prev.pitch), px - x(prev.x)) : 0;
-      const fade = 0.25 + 0.75 * (i / Math.max(1, v.trail.length - 1));
-
-      if (pt.fired > 0) {
-        drawDart(px, py, ang, 3 + (pt.fired / 127) * 3, col, 0.55 * fade + 0.35);
-      } else {
-        ctx.save();
-        ctx.translate(px, py); ctx.rotate(ang);
-        ctx.globalAlpha = 0.35 * fade;
-        ctx.strokeStyle = col;
-        ctx.lineWidth = 1.2;
-        ctx.beginPath();
-        ctx.moveTo(4, 0); ctx.lineTo(-4, 2.6); ctx.lineTo(-2, 0); ctx.lineTo(-4, -2.6);
-        ctx.closePath();
-        ctx.stroke();
-        ctx.restore();
-        ctx.globalAlpha = 1;
-      }
-    }
   }
 
   // --- the boid itself: the leading dart, glowing with its energy,
   //     plus a direct label (identity never rests on color alone)
-  const heads = voices.map(v => ({ v, px: x(v.px), py: y(v.cur) }));
+  const heads = voices.map(v => ({ v, px: x(v.px), py: y(v.dispPitch) }));
 
   for (const h of heads) {
     const { v, px, py } = h;
@@ -556,7 +517,9 @@ function draw() {
     }
     const arrow = v.isHeld ? "·" : v.dir > 0 ? "↑" : v.dir < 0 ? "↓" : "·";
     ctx.fillStyle = ink(v.isHeld ? "--ink-2" : "--ink-1");
-    ctx.fillText(`V${v.ch} ${noteName(v.cur)} ${arrow}`, px + side * 20, ly);
+    // Note name dropped from the floating label — the pitch still reads off the
+    // vertical axis and the legend. Just voice id + heading rides with the boid.
+    ctx.fillText(`V${v.ch} ${arrow}`, px + side * 20, ly);
   }
 
   renderLegend(voices);
@@ -704,6 +667,19 @@ demoBtn.addEventListener("click", () => {
       cc(CC.FIRE, fired, ch);
     });
   }, 220);
+});
+
+// Reset: kill every boid on the stage. Wipes voices, trails and the count so
+// the flock starts fresh — a stuck "held" voice or a churned trail can be
+// cleared without touching Logic. Also stops the demo feed if it's running.
+document.getElementById("reset").addEventListener("click", () => {
+  if (demoTimer) {
+    clearInterval(demoTimer); demoTimer = null;
+    demoBtn.setAttribute("aria-pressed", "false");
+  }
+  state.voices.clear();
+  state.count = 0;
+  setStatus(bound ? "listening on " + bound.name : "idle", !!bound);
 });
 
 document.getElementById("tableBtn").addEventListener("click", e => {
